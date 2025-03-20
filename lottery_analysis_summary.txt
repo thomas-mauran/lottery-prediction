@@ -1,0 +1,24 @@
+Lottery Analysis Summary (2007-2017)
+==================================================
+
+Most Common Main Numbers:
+Number 41: 165 times
+Number 22: 162 times
+Number 13: 152 times
+Number 1: 149 times
+Number 33: 148 times
+
+Most Common Lucky Numbers:
+Number 7: 161 times
+Number 1: 153 times
+Number 4: 143 times
+
+Prize Statistics:
+Average 1st Prize: €1,264,616.55
+Maximum 1st Prize: €24,000,000.00
+Minimum 1st Prize: €0.00
+
+Winner Statistics:
+Average number of 1st prize winners: 0.26
+Average number of 2nd prize winners: 2.13
+Average number of 3rd prize winners: 538.69
