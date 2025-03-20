@@ -8,91 +8,73 @@ import argparse
 from collections import Counter
 import random
 import os
+import math
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import multiprocessing
+import sys
 
 class EuroMillionsTransformer(nn.Module):
-    def __init__(self, input_dim, d_model=256, nhead=8, num_layers=6, dropout=0.2):
+    def __init__(self, input_dim, d_model=64, nhead=2, num_layers=1, dropout=0.1):
         super().__init__()
         
-        # Split input dimensions
-        self.temporal_dim = 10  # First 10 features are temporal
-        self.other_dim = input_dim - self.temporal_dim
-        
-        # Enhanced embedding with multiple layers
-        self.embedding = nn.Sequential(
-            nn.Linear(self.other_dim, d_model),
-            nn.LayerNorm(d_model),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
+        # Very simple architecture
+        self.input_projection = nn.Sequential(
+            nn.Linear(input_dim, d_model),
             nn.ReLU(),
             nn.Dropout(dropout)
         )
         
-        # Separate embedding for temporal features
-        self.temporal_embedding = nn.Sequential(
-            nn.Linear(self.temporal_dim, d_model // 2),
-            nn.LayerNorm(d_model // 2),
-            nn.ReLU(),
-            nn.Linear(d_model // 2, d_model)
+        # Single transformer encoder layer with reduced complexity
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=d_model,  # Reduced feedforward dimension
+                dropout=dropout,
+                batch_first=True
+            ),
+            num_layers=num_layers
         )
         
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=d_model * 4,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        # Main numbers prediction head
-        self.main_numbers_head = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.LayerNorm(d_model * 2),
+        # Direct prediction heads
+        self.main_numbers_head = nn.Linear(d_model, 50)
+        self.star_numbers_head = nn.Linear(d_model, 12)
+    
+    def forward(self, x):
+        x = self.input_projection(x)
+        x = self.transformer(x.unsqueeze(1)).squeeze(1)
+        return torch.sigmoid(self.main_numbers_head(x)), torch.sigmoid(self.star_numbers_head(x))
+
+class ResidualBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 2, d_model),
-            nn.LayerNorm(d_model),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, 50),  # Output probabilities for numbers 1-50
-            nn.Sigmoid()
-        )
-        
-        # Star numbers prediction head
-        self.star_numbers_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, 12),  # Output probabilities for numbers 1-12
-            nn.Sigmoid()
+            nn.Dropout(0.1),
+            nn.Linear(dim, dim)
         )
     
     def forward(self, x):
-        # Split temporal and other features
-        temporal_features = x[:, :self.temporal_dim]
-        other_features = x[:, self.temporal_dim:]
+        return x + self.layers(x)
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
         
-        # Process features
-        temporal_embedded = self.temporal_embedding(temporal_features)
-        other_embedded = self.embedding(other_features)
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
         
-        # Combine embeddings
-        combined = temporal_embedded + other_embedded
-        
-        # Apply transformer
-        x = combined.unsqueeze(1)  # Add sequence dimension
-        x = self.transformer(x)
-        x = x.squeeze(1)  # Remove sequence dimension
-        
-        # Generate predictions
-        main_numbers = self.main_numbers_head(x)
-        star_numbers = self.star_numbers_head(x)
-        
-        return main_numbers, star_numbers
+    def forward(self, x):
+        x = x + self.pe[:x.size(0)]
+        return self.dropout(x)
 
 def load_and_prepare_data(csv_dir='csv'):
     """Load and combine all CSV files"""
@@ -133,59 +115,31 @@ def load_and_prepare_data(csv_dir='csv'):
     return combined_df
 
 def prepare_features(df):
-    """Prepare enhanced features for the transformer model"""
+    """Prepare minimal features for the transformer model"""
     feature_dict = {}
     
-    # Enhanced date features
-    feature_dict.update({
-        'year': df['date_de_tirage'].dt.year,
-        'month': df['date_de_tirage'].dt.month,
-        'day': df['date_de_tirage'].dt.day,
-        'day_of_week': df['date_de_tirage'].dt.dayofweek,
-        'week_of_year': df['date_de_tirage'].dt.isocalendar().week,
-        'day_of_year': df['date_de_tirage'].dt.dayofyear,
-    })
-    
-    # Cyclical encoding for temporal features
-    feature_dict.update({
-        'month_sin': np.sin(2 * np.pi * feature_dict['month']/12),
-        'month_cos': np.cos(2 * np.pi * feature_dict['month']/12),
-        'day_sin': np.sin(2 * np.pi * feature_dict['day']/31),
-        'day_cos': np.cos(2 * np.pi * feature_dict['day']/31)
-    })
-    
-    # Historical draw features with more context (last 10 draws)
-    for i in range(1, 11):
+    # Historical draw features with minimal context (last 3 draws only)
+    for i in range(1, 4):  # Reduced from 10 to 3 previous draws
         # Main numbers
         for j in range(1, 6):
             feature_dict[f'prev_{i}_ball_{j}'] = df[f'boule_{j}'].shift(i)
-        
-        # Add sum and statistical features for previous draws
-        prev_numbers = df[[f'boule_{j}' for j in range(1, 6)]].shift(i)
-        feature_dict[f'prev_{i}_sum'] = prev_numbers.sum(axis=1)
-        feature_dict[f'prev_{i}_mean'] = prev_numbers.mean(axis=1)
-        feature_dict[f'prev_{i}_std'] = prev_numbers.std(axis=1)
         
         # Star numbers (both stars)
         feature_dict[f'prev_{i}_star_1'] = df['etoile_1'].shift(i)
         feature_dict[f'prev_{i}_star_2'] = df['etoile_2'].shift(i)
     
-    # Add rolling statistics
-    window_sizes = [5, 10, 20]
-    for window in window_sizes:
-        # Rolling statistics for main numbers
-        for j in range(1, 6):
-            roll_mean = df[f'boule_{j}'].rolling(window).mean()
-            roll_std = df[f'boule_{j}'].rolling(window).std()
-            feature_dict[f'roll_{window}_mean_ball_{j}'] = roll_mean
-            feature_dict[f'roll_{window}_std_ball_{j}'] = roll_std
-        
-        # Rolling statistics for star numbers (both stars)
-        for j in range(1, 3):
-            roll_mean = df[f'etoile_{j}'].rolling(window).mean()
-            roll_std = df[f'etoile_{j}'].rolling(window).std()
-            feature_dict[f'roll_{window}_mean_star_{j}'] = roll_mean
-            feature_dict[f'roll_{window}_std_star_{j}'] = roll_std
+    # Add only the most relevant rolling statistics with a small window
+    window_size = 5  # Only use one small window size
+    
+    # Rolling statistics for main numbers
+    for j in range(1, 6):
+        roll_mean = df[f'boule_{j}'].rolling(window_size).mean()
+        feature_dict[f'roll_{window_size}_mean_ball_{j}'] = roll_mean
+    
+    # Rolling statistics for star numbers
+    for j in range(1, 3):
+        roll_mean = df[f'etoile_{j}'].rolling(window_size).mean()
+        feature_dict[f'roll_{window_size}_mean_star_{j}'] = roll_mean
     
     # Create DataFrame all at once to avoid fragmentation
     features = pd.DataFrame(feature_dict)
@@ -269,207 +223,241 @@ def process_predictions(raw_predictions, num_count, min_val, max_val, min_gap=2)
     
     return sorted(final_numbers)
 
-def evaluate_model(model, test_features, test_data):
-    """Evaluate transformer model predictions"""
-    model.eval()
-    results = []
-    total_predictions = len(test_features)
+# Add Dataset class for better data loading
+class LotteryDataset(Dataset):
+    def __init__(self, features, main_numbers, star_numbers):
+        """Initialize dataset with tensor conversions"""
+        self.features = torch.FloatTensor(features)
+        self.main_numbers = torch.FloatTensor(main_numbers)
+        self.star_numbers = torch.FloatTensor(star_numbers)
+        assert len(self.features) == len(self.main_numbers) == len(self.star_numbers), \
+            "All inputs must have the same length"
     
-    with torch.no_grad():
-        for i in range(len(test_features)):
-            # Get model predictions
-            features = torch.FloatTensor(test_features[i:i+1])
-            main_numbers, star_numbers = model(features)
-            
-            # Process main numbers predictions (1-50)
-            main_pred = process_predictions(main_numbers, 5, 1, 50, min_gap=2)
-            
-            # Process star numbers predictions (1-12)
-            star_pred = process_predictions(star_numbers, 2, 1, 12, min_gap=1)
-            
-            # Get actual numbers for this draw
-            actual_main = sorted([
-                test_data.iloc[i]['boule_1'],
-                test_data.iloc[i]['boule_2'],
-                test_data.iloc[i]['boule_3'],
-                test_data.iloc[i]['boule_4'],
-                test_data.iloc[i]['boule_5']
-            ])
-            
-            actual_stars = sorted([
-                test_data.iloc[i]['etoile_1'],
-                test_data.iloc[i]['etoile_2']
-            ])
-            
-            # Evaluate prediction
-            eval_result = evaluate_prediction(main_pred, actual_main, star_pred, actual_stars)
-            results.append(eval_result)
+    def __len__(self):
+        return len(self.features)
     
-    # Calculate metrics
-    avg_matches = np.mean([r['matches'] for r in results])
-    avg_star_matches = np.mean([r['star_matches'] for r in results])
-    avg_sum_diff = np.mean([r['sum_diff'] for r in results])
-    avg_within_5 = np.mean([r['numbers_within_5'] for r in results])
-    match_distribution = Counter([r['matches'] for r in results])
-    star_match_distribution = Counter([r['star_matches'] for r in results])
-    
-    return {
-        'avg_matches': avg_matches,
-        'avg_star_matches': avg_star_matches,
-        'avg_sum_diff': avg_sum_diff,
-        'avg_within_5': avg_within_5,
-        'match_distribution': match_distribution,
-        'star_match_distribution': star_match_distribution
-    }
+    def __getitem__(self, idx):
+        if idx >= len(self):
+            raise IndexError(f"Index {idx} out of bounds for dataset of size {len(self)}")
+        return (self.features[idx], self.main_numbers[idx], self.star_numbers[idx])
 
-def train_model(train_features, train_data, epochs=2000, batch_size=128):
-    """Train the transformer model with improved training process"""
-    input_dim = train_features.shape[1]
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, num_cycles=0.5, last_epoch=-1):
+    """
+    Create a schedule with a learning rate that decreases following the values of the cosine function between the
+    initial lr set in the optimizer to 0, after a warmup period during which it increases linearly between 0 and the
+    initial lr set in the optimizer.
+    """
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
+
+def train_model(features, data, epochs=50, model_path='models/euromillions_model.pt'):
+    """Train the model or load from file if it exists"""
+    # Create models directory if it doesn't exist
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    
+    # Define model
+    input_dim = features.shape[1]
     model = EuroMillionsTransformer(input_dim)
     
-    # Reduce initial learning rate and adjust weight decay
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.001)
+    # If model exists and we're not in evaluation mode, just load it
+    if os.path.exists(model_path) and not sys.argv[1:] == ['--evaluate']:
+        print(f"\nLoading existing model from {model_path}")
+        model.load_state_dict(torch.load(model_path))
+        return model
     
-    # Custom loss function for number selection with adjusted weights
-    def number_selection_loss(pred, target, num_to_select):
-        # Sort predictions and get top k indices
-        topk_values, topk_indices = torch.topk(pred, k=num_to_select)
-        
-        # Create a binary mask for selected numbers
-        selected = torch.zeros_like(pred)
-        selected.scatter_(1, topk_indices, 1)
-        
-        # Calculate BCE loss for selected vs. target numbers
-        bce_loss = nn.BCELoss()(selected.float(), target.float())
-        
-        # Add regularization to encourage diverse predictions with reduced weight
-        diversity_loss = -torch.std(pred, dim=1).mean()
-        
-        return bce_loss + 0.05 * diversity_loss  # Reduced diversity loss weight
+    print("\nTraining new model...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    model = model.to(device)
     
-    # Convert targets to one-hot encoding
+    # Prepare data
+    train_main_numbers = np.column_stack([
+        data[f'boule_{i}'].values - 1 for i in range(1, 6)
+    ])
+    train_star_numbers = np.column_stack([
+        data[f'etoile_{i}'].values - 1 for i in range(1, 3)
+    ])
+    
     def to_one_hot(numbers, max_val):
         one_hot = torch.zeros(len(numbers), max_val)
         for i, nums in enumerate(numbers):
-            one_hot[i, (nums - 1).astype(int)] = 1
+            one_hot[i, nums.astype(int)] = 1
         return one_hot
-    
-    # Prepare targets
-    train_main_numbers = np.column_stack([
-        train_data['boule_1'].values,
-        train_data['boule_2'].values,
-        train_data['boule_3'].values,
-        train_data['boule_4'].values,
-        train_data['boule_5'].values
-    ])
-    
-    train_star_numbers = np.column_stack([
-        train_data['etoile_1'].values,
-        train_data['etoile_2'].values
-    ])
     
     train_main_one_hot = to_one_hot(train_main_numbers, 50)
     train_star_one_hot = to_one_hot(train_star_numbers, 12)
     
-    # Learning rate scheduler with longer warmup and gentler cosine annealing
-    total_steps = epochs * (len(train_features) // batch_size)
-    warmup_steps = total_steps // 5  # 20% warmup
+    # Create dataset and dataloader
+    dataset = LotteryDataset(features, train_main_one_hot, train_star_one_hot)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=128,
+        shuffle=True,
+        num_workers=2,  # Reduced workers
+        pin_memory=True
+    )
     
-    def lr_lambda(current_step):
-        if current_step < warmup_steps:
-            return float(current_step) / float(max(1, warmup_steps))
-        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        return 0.5 * (1.0 + np.cos(np.pi * progress)) + 0.1  # Add minimum learning rate
-    
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    # Simple optimizer with high learning rate
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
     
     best_loss = float('inf')
-    patience = 200  # Increased patience significantly
+    best_state = None
+    patience = 5  # Very short patience
     patience_counter = 0
-    min_delta = 0.0001  # Slightly increased improvement threshold
-    
-    # Keep track of losses for smoothing
-    loss_history = []
-    smoothing_window = 50  # Increased smoothing window
     
     for epoch in range(epochs):
         model.train()
         total_loss = 0
-        num_batches = len(train_features) // batch_size
+        num_batches = 0
         
-        # Shuffle data for each epoch
-        indices = np.random.permutation(len(train_features))
-        train_features = train_features[indices]
-        train_main_one_hot = train_main_one_hot[indices]
-        train_star_one_hot = train_star_one_hot[indices]
-        
-        for i in range(num_batches):
-            start_idx = i * batch_size
-            end_idx = start_idx + batch_size
-            
-            batch_features = torch.FloatTensor(train_features[start_idx:end_idx])
-            batch_main_targets = train_main_one_hot[start_idx:end_idx]
-            batch_star_targets = train_star_one_hot[start_idx:end_idx]
+        for batch_features, batch_main_targets, batch_star_targets in dataloader:
+            batch_features = batch_features.to(device)
+            batch_main_targets = batch_main_targets.to(device)
+            batch_star_targets = batch_star_targets.to(device)
             
             optimizer.zero_grad()
             main_pred, star_pred = model(batch_features)
             
-            # Calculate losses with number selection constraint
-            main_loss = number_selection_loss(main_pred, batch_main_targets, 5)
-            star_loss = number_selection_loss(star_pred, batch_star_targets, 2)
-            
-            # Adjusted loss weights
-            loss = 0.8 * main_loss + 0.2 * star_loss
+            # Simple BCE loss
+            loss = F.binary_cross_entropy(main_pred, batch_main_targets) + \
+                   F.binary_cross_entropy(star_pred, batch_star_targets)
             
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Increased gradient clipping
             optimizer.step()
-            scheduler.step()
             
             total_loss += loss.item()
+            num_batches += 1
         
         avg_loss = total_loss / num_batches
-        loss_history.append(avg_loss)
         
-        # Calculate smoothed loss with longer window
-        if len(loss_history) >= smoothing_window:
-            smoothed_loss = np.mean(loss_history[-smoothing_window:])
-        else:
-            smoothed_loss = avg_loss
+        if epoch % 5 == 0:  # Print less frequently
+            print(f"Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}")
         
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}, Smoothed Loss: {smoothed_loss:.4f}")
-        
-        # Early stopping with increased patience and threshold
-        if smoothed_loss < best_loss - min_delta:
-            best_loss = smoothed_loss
+        if avg_loss < best_loss:
+            best_loss = avg_loss
             best_state = model.state_dict().copy()
             patience_counter = 0
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 print(f"\nEarly stopping triggered after {epoch + 1} epochs")
-                print(f"Best loss: {best_loss:.4f}")
                 break
     
-    # Restore best model
+    # Save best model
+    model = model.cpu()
     model.load_state_dict(best_state)
+    torch.save(model.state_dict(), model_path)
+    
     return model
+
+def evaluate_model(model, test_features, test_data):
+    """Evaluate transformer model predictions"""
+    model.eval()
+    results = []
+    
+    # Ensure all inputs have the same length
+    n_samples = len(test_features)
+    assert n_samples == len(test_data), "Test features and data must have the same length"
+    
+    # Create dataset and dataloader for test data
+    test_main_numbers = np.column_stack([
+        test_data[f'boule_{i}'].values - 1 for i in range(1, 6)
+    ])
+    test_star_numbers = np.column_stack([
+        test_data[f'etoile_{i}'].values - 1 for i in range(1, 3)
+    ])
+    
+    def to_one_hot(numbers, max_val):
+        one_hot = torch.zeros(len(numbers), max_val)
+        for i, nums in enumerate(numbers):
+            one_hot[i, nums.astype(int)] = 1
+        return one_hot
+    
+    test_main_one_hot = to_one_hot(test_main_numbers, 50)
+    test_star_one_hot = to_one_hot(test_star_numbers, 12)
+    
+    # Create dataset and dataloader
+    dataset = LotteryDataset(test_features, test_main_one_hot, test_star_one_hot)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=min(8, n_samples),  # Ensure batch size doesn't exceed dataset size
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True
+    )
+    
+    device = next(model.parameters()).device
+    
+    with torch.no_grad():
+        for batch_features, batch_main_targets, batch_star_targets in dataloader:
+            # Move batch to device
+            batch_features = batch_features.to(device)
+            
+            # Get model predictions
+            main_pred, star_pred = model(batch_features)
+            
+            # Move predictions back to CPU for processing
+            main_pred = main_pred.cpu()
+            star_pred = star_pred.cpu()
+            
+            # Process each prediction in the batch
+            for i in range(len(batch_features)):
+                # Process predictions
+                main_numbers = main_pred[i].numpy()
+                star_numbers = star_pred[i].numpy()
+                
+                # Get top 5 main numbers and top 2 star numbers
+                main_indices = np.argsort(main_numbers)[-5:]
+                star_indices = np.argsort(star_numbers)[-2:]
+                
+                prediction = np.concatenate([
+                    main_indices + 1,  # Add 1 to convert from 0-based to 1-based
+                    star_indices + 1
+                ])
+                
+                # Get actual numbers for this draw
+                actual_main = sorted([
+                    test_data.iloc[i]['boule_1'],
+                    test_data.iloc[i]['boule_2'],
+                    test_data.iloc[i]['boule_3'],
+                    test_data.iloc[i]['boule_4'],
+                    test_data.iloc[i]['boule_5']
+                ])
+                
+                actual_stars = sorted([
+                    test_data.iloc[i]['etoile_1'],
+                    test_data.iloc[i]['etoile_2']
+                ])
+                
+                # Calculate matches
+                main_matches = len(set(prediction[:5]) & set(actual_main))
+                star_matches = len(set(prediction[5:]) & set(actual_stars))
+                
+                results.append({
+                    'main_matches': main_matches,
+                    'star_matches': star_matches
+                })
+    
+    # Convert results to arrays
+    main_matches = np.array([r['main_matches'] for r in results])
+    star_matches = np.array([r['star_matches'] for r in results])
+    
+    return {
+        'main_matches': main_matches,
+        'star_matches': star_matches
+    }
 
 def main():
     parser = argparse.ArgumentParser(description='EuroMillions prediction with transformer model')
     parser.add_argument('--evaluate', action='store_true', help='Run evaluation on test data')
-    parser.add_argument('--epochs', type=int, default=500, help='Number of training epochs (recommended: 500+)')
+    parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
+    parser.add_argument('--model-path', type=str, default='models/euromillions_model.pt', help='Path to save/load model')
     args = parser.parse_args()
-    
-    # Add warning for low epoch count
-    if args.epochs < 200:
-        print("\nWarning: Using less than 200 epochs may result in suboptimal model performance.")
-        print("Recommended: Use 500+ epochs for better results.")
-        user_input = input("Do you want to continue with the current number of epochs? (y/n): ")
-        if user_input.lower() != 'y':
-            print("Exiting. Please run again with more epochs using --epochs argument.")
-            return
     
     try:
         # Load and prepare data
@@ -492,89 +480,91 @@ def main():
         print(f"Average sum: {avg_sum:.1f} ± {std_sum:.1f}")
         print(f"Average gap between numbers: {avg_gap:.1f}")
         
-        # Prepare features
-        features, scaler = prepare_features(df)
-        
         if args.evaluate:
             print("\nRunning evaluation on test data...")
+            
+            # Prepare features first
+            features, scaler = prepare_features(df)
             
             # Split data into training and testing sets (90-10 split)
             train_size = int(0.9 * len(features))
             train_features = features[:train_size]
             test_features = features[train_size:]
-            train_data = df.iloc[5:train_size+5]  # Offset by 5 due to historical features
-            test_data = df.iloc[train_size+5:]
+            
+            # Split the original dataframe at the same point
+            train_data = df.iloc[len(df)-len(features):].iloc[:train_size]
+            test_data = df.iloc[len(df)-len(features):].iloc[train_size:]
             
             print(f"\nTraining data: {len(train_features)} draws")
             print(f"Testing data: {len(test_features)} draws")
             
             # Train model
-            print("\nTraining transformer model...")
-            model = train_model(train_features, train_data, epochs=args.epochs)
+            model = train_model(train_features, train_data, epochs=args.epochs, model_path=args.model_path)
             
             # Evaluate model
             print("\nEvaluating model performance...")
             results = evaluate_model(model, test_features, test_data)
             
-            print("\nEuroMillions Transformer Model Results:")
-            total_predictions = sum(results['match_distribution'].values())
+            # Print results
+            total_predictions = len(results['main_matches'])
+            print(f"\nEuroMillions Transformer Model Results:")
             print(f"Total draws evaluated: {total_predictions}")
-            print(f"Average main number matches per draw: {results['avg_matches']:.2f}")
-            print(f"Average star number matches per draw: {results['avg_star_matches']:.2f}")
-            print(f"Average sum difference: {results['avg_sum_diff']:.2f}")
-            print(f"Average numbers within ±5: {results['avg_within_5']:.2f}")
+            print(f"Average main number matches per draw: {np.mean(results['main_matches']):.2f}")
+            print(f"Average star number matches per draw: {np.mean(results['star_matches']):.2f}")
             
             print(f"\nMain number match distribution (out of {total_predictions} draws):")
             for matches in range(6):  # 0 to 5 matches
-                count = results['match_distribution'].get(matches, 0)
+                count = np.sum(results['main_matches'] == matches)
                 percentage = (count / total_predictions) * 100
                 print(f"{matches} matches: {count}/{total_predictions} ({percentage:.1f}%)")
             
             print(f"\nStar number match distribution (out of {total_predictions} draws):")
             for matches in range(3):  # 0 to 2 matches for star numbers
-                count = results['star_match_distribution'].get(matches, 0)
+                count = np.sum(results['star_matches'] == matches)
                 percentage = (count / total_predictions) * 100
                 print(f"{matches} matches: {count}/{total_predictions} ({percentage:.1f}%)")
             
             # Add summary statistics
             print("\nSummary:")
-            print(f"Draws with at least 1 main number match: {sum(count for matches, count in results['match_distribution'].items() if matches > 0)}/{total_predictions}")
-            print(f"Draws with at least 1 star match: {sum(count for matches, count in results['star_match_distribution'].items() if matches > 0)}/{total_predictions}")
-            max_main_matches = max(results['match_distribution'].keys())
-            max_star_matches = max(results['star_match_distribution'].keys())
+            print(f"Draws with at least 1 main number match: {np.sum(results['main_matches'] > 0)}/{total_predictions}")
+            print(f"Draws with at least 1 star match: {np.sum(results['star_matches'] > 0)}/{total_predictions}")
+            max_main_matches = np.max(results['main_matches'])
+            max_star_matches = np.max(results['star_matches'])
             print(f"Best performance: {max_main_matches} main numbers and {max_star_matches} star numbers matched")
         
         else:
-            # Train on all data for prediction
-            train_data = df.iloc[5:]  # Offset by 5 due to historical features
-            model = train_model(features, train_data, epochs=args.epochs)
+            # Train or load model for prediction
+            features, scaler = prepare_features(df)
+            train_data = df.iloc[len(df)-len(features):]
+            model = train_model(features, train_data, epochs=args.epochs, model_path=args.model_path)
             
             # Make prediction for next draw
             print("\nGenerating predictions...")
             with torch.no_grad():
-                # Convert features to tensor properly
-                latest_features = torch.FloatTensor(features[-1:])  # Get last row and convert to tensor
-                main_numbers, star_numbers = model(latest_features)  # Use the tensor
+                latest_features = torch.FloatTensor(features[-1:])
+                main_pred, star_pred = model(latest_features)
                 
-                # Process predictions with spacing constraints
-                main_pred = process_predictions(main_numbers, 5, 1, 50, min_gap=2)
-                star_pred = process_predictions(star_numbers, 2, 1, 12, min_gap=1)
+                # Process predictions
+                main_numbers = main_pred[0].numpy()
+                star_numbers = star_pred[0].numpy()
+                
+                # Get top 5 main numbers and top 2 star numbers
+                main_indices = np.argsort(main_numbers)[-5:] + 1  # Add 1 for 1-based indexing
+                star_indices = np.argsort(star_numbers)[-2:] + 1
+                
+                # Sort the predictions
+                main_indices = sorted(main_indices)
+                star_indices = sorted(star_indices)
                 
                 # Calculate gaps for display
-                gaps = [main_pred[i+1] - main_pred[i] for i in range(len(main_pred)-1)]
+                gaps = [main_indices[i+1] - main_indices[i] for i in range(len(main_indices)-1)]
                 
                 print("\nEuroMillions Transformer Model Predictions:")
-                print(f"Main numbers: {main_pred}")
-                print(f"Sum: {sum(main_pred)} (historical avg: {avg_sum:.1f})")
+                print(f"Main numbers: {main_indices}")
+                print(f"Sum: {sum(main_indices)} (historical avg: {avg_sum:.1f})")
                 print(f"Gaps between numbers: {gaps}")
                 print(f"Average gap: {np.mean(gaps):.1f} (historical avg: {avg_gap:.1f})")
-                print(f"Star numbers: {star_pred}")  # Show both star numbers
-                
-                # Validate prediction
-                if min(gaps) < 2:
-                    print("\nWarning: Some numbers are too close together!")
-                if abs(sum(main_pred) - avg_sum) > std_sum:
-                    print("\nWarning: Sum is outside the typical range!")
+                print(f"Star numbers: {star_indices}")
     
     except Exception as e:
         print(f"\nAn error occurred: {str(e)}")
